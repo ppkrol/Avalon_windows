@@ -124,13 +124,17 @@ Status Fazy 4 (SPLIT wylaczony, `GGML_CUDA_MOE_PIN=0`, MTP, `-c 32768`, 512 toke
 - Poprawka (punkt 12 Fazy 1, stala 3072 MiB na inne procesy, razem z rezerwa 400 MiB: 3472 MiB; inne procesy zajmuja tu stale 2 - 2,5 GB), bez zmiennych, 4 przebiegi: z MTP 37,0 / 76,4 / 87,1 / 83,6 t/s (autor 91,0), bez MTP 53,5 / 61,0 / 65,5 / 65,0 t/s (autor 62,4). Cache 15 422 MiB, praca GPU w oknie 90 us, GPU miedzy warstwami 227 us, maks. pamiec wspoldzielona serwera 913 MiB (bez MTP 574).
 - Page faulty (poprawka z punktu 12, MTP, bez `GGML_CUDA_MOE_TIMELINE`, cache plikow cieply, liczniki `PerfProc_Process` i `PerfOS_Memory` co sekunde): przebiegi 62,8 / 85,1 / 90,8 / 92,2 t/s (autor 91,0 przy 96 GB RAM). Miekkie faulty (strony z cache plikow wchodza do working setu) 200 - 550 tys./s w pierwszym zapytaniu (working set 21 -> 40 GB), potem 10 - 60 tys./s; odczyty z dysku w stanie ustalonym ok. 9 tys. stron/s (ok. 35 MB/s). Wiersze CPU 272 us na warstwe (2,79 wiersza). Limit RAM kosztuje glownie pierwsze zapytanie po starcie serwera.
 - `GGML_CUDA_MOE_TIMELINE` spowalnia pomiar: mierzy czas kazdego zapytania strumienia (ok. 200 mln wywolan), wiersze CPU 448 zamiast 272 us. Liczby z Fazy 4 zebrane z ta diagnostyka sa zanizone o kilka t/s.
-- Nie sprawdzone: zimny start po restarcie komputera (model poza cache plikow) i dluga sesja, w ktorej working set dochodzi do konca RAM i Windows zaczyna go przycinac.
+- Dluga sesja (31 zapytan po 512 tokenow na rozne tematy i jezyki, MTP, swiezy proces): RAM zapelnia sie po ok. 4 zapytaniach (working set ok. 54,5 GB, wolne 0,3 - 2 GB). Zapytania 1 - 6: 67 / 49 / 58 / 53 / 38 / 38 t/s przy odczytach z dysku 20 - 37 tys. stron/s (80 - 150 MB/s); potem zwykle 70 - 87 t/s przy 3 - 27 tys. stron/s, pojedyncze spadki do 42 - 63 t/s; powtorka pierwszego zapytania na koncu 85,0 t/s. Wiersze CPU 362 us na warstwe przy 3,68 wiersza (mieszane tematy). Limit 64 GB RAM kosztuje wiec ok. 10 - 15% w stanie ustalonym i do ok. 40% w pierwszych minutach z nowymi tematami.
+- Sprawdzone i odrzucone: niski priorytet pamieci (`SetThreadInformation`, `ThreadMemoryPriority`, `MEMORY_PRIORITY_VERY_LOW`) dla watku fill i preloadu, zeby Windows najpierw zwalnial strony czytane tylko dla cache VRAM. A/B/A/B, po 16 zapytan na rozne tematy plus powtorka, t/s wazone tokenami: bazowa 51,6 / 60,3, z priorytetem 59,7 / 61,6 (pierwsza para zaburzona kolejnoscia). Zysk na starcie (57 wobec 46 t/s w drugiej parze), strata w stanie ustalonym (63 wobec 72), powtarzalna regresja jednego zapytania (36 - 37 wobec 56 - 59 t/s przy mniejszych odczytach z dysku). Bez wyraznego zysku, zmiana cofnieta.
+- Nie sprawdzone: zimny start po restarcie komputera (model poza cache plikow).
 
 Opcjonalnie: odczyt przepustowosci PCIe przez SetupAPI (`DEVPKEY_PciDevice_MaxLinkSpeed`, `DEVPKEY_PciDevice_MaxLinkWidth`) zamiast domyslnej wartosci w punkcie 4 Fazy 1. Dispatcher hosted MoE uzywa tej liczby do decyzji, wiec zla wartosc kosztuje wydajnosc.
 
 ## Faza 5 (opcjonalna): instalator
 
-`install.ps1` jako odpowiednik `install.sh`: sprawdzenie narzedzi, build, pobranie modelu z weryfikacja SHA-256 (fragment w Pythonie z `install.sh` przenosi sie bez zmian) i launcher `avalon-server.cmd`. Robic dopiero, gdy Etap A dziala.
+Launcher jest gotowy: `scripts\avalon-server.cmd` (komenda z `install.sh`, `-c 262144`, MTP, `GGML_CUDA_MOE_PIN=0`, DLL-e z `%HIP_PATH%bin`). Ustawienia przez zmienne: `MODEL_DIR` (domyslnie `F:\llama-vulkan\models\Qwen3.8-Flash-Next-Avalon`), `HOST` (127.0.0.1), `PORT` (8080); `LLAMA_API_KEY` czyta sam `llama-server`. Dodatkowe argumenty ida do `llama-server`, np. `scripts\avalon-server.cmd -c 65536`.
+
+Do zrobienia: `install.ps1` jako odpowiednik `install.sh`: sprawdzenie narzedzi, build, pobranie modelu z weryfikacja SHA-256 (fragment w Pythonie z `install.sh` przenosi sie bez zmian) i launcher `avalon-server.cmd`. Robic dopiero, gdy Etap A dziala.
 
 ## Punkty decyzyjne i plan B
 
