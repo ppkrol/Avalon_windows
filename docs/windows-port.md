@@ -45,10 +45,11 @@ Zasada: najmniejsza zmiana, guard `#if defined(__linux__)` albo galaz `_WIN32` w
 | 7 | `ggml-cpu.c` `ggml_cpu_moe_experts_multi()` (ok. 4573) | `#if defined(__AVX2__) && defined(GGML_USE_OPENMP)`: bez OpenMP kod po cichu wypada | `libomp` z toolsetu MSVC (Faza 0), sprawdzic "Found OpenMP" |
 | 8 | testy autora (`tests/hybgpubench/*.sh`, `tests/coopbench`) | skrypty i pliki `.hip` pod Linuksa | `-DLLAMA_BUILD_TESTS=OFF`, budowac tylko potrzebne cele |
 | 9 | `moe-cache.cu` (przed `#include <windows.h>`) | `windows.h` definiuje makra `min` i `max`, ktore psuja `std::min` i `std::max` | `#define NOMINMAX` (wzorzec z `llama-mmap.cpp`) |
+| 10 | `ggml-cuda.cu` `ggml_backend_cuda_set_tensor_2d_async()` i `ggml_backend_cuda_buffer_set_tensor_2d()` | `hipMemcpy2DAsync` z pliku mapowanego (`MapViewOfFile`) kopiuje same zera i zwraca sukces (ze sterty dziala). Scheduler kopiuje tak eksperty do offloadu `MUL_MAT_ID` od 32 tokenow w batchu (`GGML_OP_OFFLOAD_MIN_BATCH`), wiec prefill dawal NaN | pomocnik `ggml_cuda_memcpy_2d_h2d_async`: pod `_WIN32` + HIP kopia wiersz po wierszu zwyklym `hipMemcpyAsync` (z mmap dziala), gdzie indziej bez zmian |
 
 Status (build `llama-server`, `llama-cli`, `llama-bench` przechodzi, `llama-server --list-devices` widzi RX 7900 XTX): punkty 1-4 i 9 zrobione, punkt 5 bez zmian (brak sysfs konczy sie logiem "sysfs unavailable, using hip", bez bledu), 6-8 rozwiazane opcjami cmake. Kernele HIP z `__attribute__((address_space))` (`mmvq.cu`) i `ext_vector_type` (`qwen4-hc.cu`) kompiluja sie bez zmian.
 
-Pozostale ryzyko z Fazy 1: `ggml_hip_set_hw_queues()` to konstruktor statyczny. Sprawdzic w Fazie 2, czy `GPU_MAX_HW_QUEUES` i spol. dzialaja, skoro `amdhip64` laduje sie przy starcie procesu.
+Ryzyko z Fazy 1, `ggml_hip_set_hw_queues()` jako konstruktor statyczny: porownanie z zmiennymi ustawionymi przed startem procesu daje ten sam wynik (39,3 i 39,2 t/s), wiec nic nie trzeba zmieniac.
 
 Juz gotowe pod Windows, nie ruszac:
 
@@ -77,6 +78,18 @@ Ryzyka i bisekcja (kazde wylaczane zmienna lub opcja build, bez zmiany kodu):
 | Obejscia pod ROCr i silniki SDMA (kopie przez kernel w `ggml-cuda.cu` ok. 2935, polling fill-stream w `moe-cache.cu` ok. 2014) | wolne kopie, brak nakladania sie kopii na obliczenia | zostawic, mierzyc w Fazie 4 | stroic tylko po pomiarach |
 | `OMP_PLACES` i `OMP_PROC_BIND` ustawiane przez `ggml-cpu.c` tylko poza `_WIN32` | zespol watkow dzieli rdzenie z innymi watkami | ustawic recznie `OMP_PLACES=cores`, `OMP_PROC_BIND=spread` | jesli pomaga, dodac do galezi `_WIN32` |
 | `GPU_MAX_HW_QUEUES`, `ROCBLAS_DEVICE_MEMORY_SIZE` i `HSA_SCRATCH_SINGLE_LIMIT` (to ostatnie to zmienna ROCr z Linuksa) | brak efektu lub inny | zmierzyc bez nich i z nimi | zostawic tylko te, ktore dzialaja |
+
+Status Fazy 2 (RX 7900 XTX 24 GB, 5800X3D, 64 GB RAM, model na NVMe, `GGML_CUDA_MOE_PIN=0`, bez `TdrDelay`):
+
+- Pliki modelu: SHA-256 wszystkich 35 plikow zgodne z Hugging Face.
+- Hosted MoE dziala: cache ekspertow 19074 MiB w VRAM, preload rankingu 16,9 GiB w ok. 25 s, 8 watkow CPU, `fill-fail=0`, bez resetow GPU. `PCIe: link not readable, 13.6 GB/s assumed`, zgodnie z oczekiwaniem.
+- Perplexity (`llama-perplexity`, tekst z `docs/` i `README.md`, `-c 2048`): z `-ub 8` i `-ub 16` 5,51 i 5,52, z `-ub 512` bez offloadu 5,50. Przed punktem 10 kazdy wsad od 32 tokenow dawal NaN, niezaleznie od `MK`, `SPLIT`, `PREFILL_INPLACE`, `ROUTER`/`SGATE`, `GGML_SCHED_PREFETCH_EXPERTS` i `-fa`; gesty Qwen3.8-27B byl poprawny (PPL 4,43). Po poprawce `-ub 512`: 5,47, 3,03, 2,60, 2,80 (4 chunki).
+- `llama-server` z pelna komenda launchera, `-c 32768`, 512 tokenow greedy, stan ustalony: bez MTP ok. 42 t/s, z MTP 39 t/s (akceptacja 65 - 68%). U autora (7900 XT, Linux) 62,4 i 91,0 t/s. MTP nie daje na Windows zysku.
+- Prefill 19 tys. tokenow (`-ub 8192`, `-c 65536`): 140 t/s (u autora do 1661 t/s), bez resetu GPU. Eksperty kopiuja sie z pageable mmap przez `hipMemcpyAsync`, a 89 GiB nie miesci sie w 64 GB RAM, wiec nie da sie ich przypiac.
+- `-c 262144` startuje i generuje, 20 zapytan z rzedu przy 32k bez bledu (31 - 39 t/s).
+- `OMP_PLACES=cores`, `OMP_PROC_BIND=spread`: bez mierzalnej roznicy (ok. 41 wobec 39,3 t/s), nie dodawane do galezi `_WIN32`.
+- Nie sprawdzone: `PIN=1` (rejestracja ok. 89 GiB przy 64 GB RAM, ryzyko zawieszenia systemu), `TdrDelay`.
+- Otwarte: rzadki crash serwera na drugim zapytaniu po `slot ... selected slot by LCP similarity`, 3 z 27 uruchomien (bez regularnosci, nie odtwarza sie na zadanie). Wydruk na stderr pokazal `unspecified launch failure` zgloszone w `ggml_cuda_moe_hosted_wait` (`moe-cache.cu:6441`), a potem `hipGetDevice` tez zawodzi (kontekst urzadzenia stracony). Awaria ok. 2,9 s po starcie zapytania (w dwoch z trzech przypadkow), bez wpisu o resecie sterownika w dzienniku systemowym. Podejrzenie: TDR (domyslne 2 s) gdy kernel czeka na wiersze CPU, a watki CPU stoja na twardych page faultach z mmap. Niepotwierdzone, do sprawdzenia z wiekszym `TdrDelay`.
 
 ## Faza 3: pamiec
 
