@@ -85,7 +85,7 @@ Status Fazy 2 (RX 7900 XTX 24 GB, 5800X3D, 64 GB RAM, model na NVMe, `GGML_CUDA_
 - Pliki modelu: SHA-256 wszystkich 35 plikow zgodne z Hugging Face.
 - Hosted MoE dziala: cache ekspertow 19074 MiB w VRAM, preload rankingu 16,9 GiB w ok. 25 s, 8 watkow CPU, `fill-fail=0`, bez resetow GPU. `PCIe: link not readable, 13.6 GB/s assumed`, zgodnie z oczekiwaniem.
 - Perplexity (`llama-perplexity`, tekst z `docs/` i `README.md`, `-c 2048`): z `-ub 8` i `-ub 16` 5,51 i 5,52, z `-ub 512` bez offloadu 5,50. Przed punktem 10 kazdy wsad od 32 tokenow dawal NaN, niezaleznie od `MK`, `SPLIT`, `PREFILL_INPLACE`, `ROUTER`/`SGATE`, `GGML_SCHED_PREFETCH_EXPERTS` i `-fa`; gesty Qwen3.8-27B byl poprawny (PPL 4,43). Po poprawce `-ub 512`: 5,47, 3,03, 2,60, 2,80 (4 chunki).
-- `llama-server` z pelna komenda launchera, `-c 32768`, 512 tokenow greedy, stan ustalony: bez MTP ok. 42 t/s, z MTP 39 t/s (akceptacja 65 - 68%). U autora (7900 XT, Linux) 62,4 i 91,0 t/s. MTP nie daje na Windows zysku.
+- `llama-server` z pelna komenda launchera, `-c 32768`, 512 tokenow greedy, stan ustalony: bez MTP ok. 42 t/s, z MTP 39 t/s (akceptacja 65 - 68%). U autora (7900 XT, Linux) 62,4 i 91,0 t/s. MTP nie dawal zysku, dopoki byl wlaczony SPLIT (patrz status Fazy 4).
 - Prefill 19 tys. tokenow (`-ub 8192`, `-c 65536`): 140 t/s (u autora do 1661 t/s), bez resetu GPU. Eksperty kopiuja sie z pageable mmap przez `hipMemcpyAsync`, a 89 GiB nie miesci sie w 64 GB RAM, wiec nie da sie ich przypiac.
 - `-c 262144` startuje i generuje, 20 zapytan z rzedu przy 32k bez bledu (31 - 39 t/s).
 - `OMP_PLACES=cores`, `OMP_PROC_BIND=spread`: bez mierzalnej roznicy (ok. 41 wobec 39,3 t/s), nie dodawane do galezi `_WIN32`.
@@ -108,6 +108,15 @@ Punkty odniesienia (od najtanszego):
 3. Avalon na Linuksie na tym samym sprzecie (live USB lub dual boot): jedyne wiarygodne "liczby autora" dla tej maszyny.
 
 Narzedzia: `llama-bench`, `GGML_CUDA_MOE_TIMELINE=N` (os czasu warstw hosted), `GGML_CUDA_MOE_HOSTED_STATS=N`, `GGML_CUDA_MOE_HOSTED_THREADS`, `GGML_CUDA_MOE_SPLIT_CPU_SCALE`.
+
+Status Fazy 4 (SPLIT wylaczony, `GGML_CUDA_MOE_PIN=0`, MTP, `-c 32768`, 512 tokenow, trzeci przebieg):
+
+- Generacja z cieplym cache plikow: 54,1 t/s z MTP, 48,3 t/s bez MTP (z `GGML_CUDA_MOE_TIMELINE` i `GGML_CUDA_MOE_HOSTED_STATS`). Z zimnym cache 47 i 42 t/s. Najwiekszy rozrzut daje stan cache plikow: model ma ok. 89 GiB, RAM 64 GB, autor ma 96 GB.
+- Diagnostyka MoE w `llama-server` wymaga `-lv 4`: `common_log_get_verbosity()` mapuje INFO z ggml na TRACE.
+- Rozbicie warstwy (MTP, us): sztafeta publikacja + plan 7,5, zapytanie strumienia 0,08, praca GPU w oknie MoE 405 (model autora w `moe-cache.cu`, komentarz przed `moe_split_cpu_fixed_us`: ok. 155 dla ok. 22 wierszy), wiersze CPU 245 - 253 przy 1,9 wiersza (model autora ok. 136), GPU miedzy warstwami 236. Sztafeta GPU <-> host na Windows jest wiec tania; wolniejsze sa kernele GPU w oknie i wiersze CPU.
+- Mikrobenchmark HIP (osobny program, poza repo): odstep miedzy kernelami 1,9 us w strumieniu i w grafie. Po czekaniu GPU ponad ok. 100 us kolejne kernele zwalniaja (10 x odczyt 64 MiB: 203 us bez czekania, 218 us po 300 us, 308 - 376 us po 1 ms), niezaleznie od `s_sleep(127)`, `s_sleep(1)` czy petli bez sleep. Wyglada na obnizanie zegara pamieci przy bezczynnosci. Przy czekaniach z modelu (ok. 300 us) to tylko ok. +7%, wiec wyjasnia mala czesc roznicy.
+- Plan zasilania "Wysoka wydajnosc" i minimalny zegar GPU 2300 MHz w Adrenalinie: bez mierzalnego zysku w mikrobenchmarku ani w modelu.
+- Otwarte: co spowalnia kernele GPU w oknie MoE (potrzebny profiler kerneli albo dodatkowe znaczniki czasu) i ile wierszy CPU czeka na twarde page faulty z mmap.
 
 Opcjonalnie: odczyt przepustowosci PCIe przez SetupAPI (`DEVPKEY_PciDevice_MaxLinkSpeed`, `DEVPKEY_PciDevice_MaxLinkWidth`) zamiast domyslnej wartosci w punkcie 4 Fazy 1. Dispatcher hosted MoE uzywa tej liczby do decyzji, wiec zla wartosc kosztuje wydajnosc.
 
