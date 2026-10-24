@@ -5918,7 +5918,12 @@ static constexpr double moe_split_gpu_before_us = 23.3, moe_split_gpu_row_us = 2
 static constexpr double moe_split_gpu_after_us = 66.4, moe_split_gpu_moved_row_us = 1.5;
 
 static bool moe_split_enabled() {
+#if defined(_WIN32)
+    // off by default: on Windows the GPU can hang in k_moe_split_wait until the driver resets it (TDR)
+    static const bool enabled = getenv("GGML_CUDA_MOE_SPLIT") && atoi(getenv("GGML_CUDA_MOE_SPLIT")) != 0;
+#else
     static const bool enabled = !getenv("GGML_CUDA_MOE_SPLIT") || atoi(getenv("GGML_CUDA_MOE_SPLIT")) != 0;
+#endif
     return enabled;
 }
 
