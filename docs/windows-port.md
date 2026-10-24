@@ -14,20 +14,21 @@ Sprzet docelowy: Windows 11, Radeon RX 7900 XTX 24 GB (gfx1100, ta sama architek
 Potrzebne:
 
 - HIP SDK 7.2 (jest) i sterownik Adrenalin z obsluga HIP.
-- Visual Studio 2022 (x64 Native Tools Command Prompt: daje `cmake` i `ninja`), Git, Python 3.
-- **LLVM dla Windows z `libomp`.** HIP SDK 7.2 nie zawiera OpenMP (w `lib/` brak `libomp`). Bez niego szybka sciezka ekspertow na CPU w hosted MoE nie zostanie skompilowana (patrz punkt 7 nizej).
+- Visual Studio Build Tools z `cmake` i `ninja`, Git, Python 3. **Toolset MSVC 14.44** (komponent "MSVC v143 - VS 2022 C++ x64/x86 build tools (v14.44-17.14)"), wybierany przez `vcvars64.bat -vcvars_ver=14.44`. Domyslny toolset 14.51 z VS 18 nie nadaje sie: jego `<cmath>` deklaruje `isgreater` i pokrewne jako `constexpr` (czyli `__host__ __device__`), co koliduje z `__clang_hip_cmath.h` z clanga 21 i wywala kazdy plik `.cu` ("__device__ function 'isgreater' cannot overload __host__ __device__ function").
+- **OpenMP.** HIP SDK 7.2 go nie zawiera, ale `find_package(OpenMP)` znajduje `libomp.lib` z toolsetu MSVC (runtime `libomp140.x86_64.dll` jest w System32). `-DGGML_OPENMP_FETCH=ON` odpada: wymaga clanga 20.x, a HIP SDK ma 21. Bez OpenMP szybka sciezka ekspertow na CPU w hosted MoE nie zostanie skompilowana (patrz punkt 7 nizej).
 
-Konfiguracja (wg `docs/build.md`, sekcja HIP dla Windows):
+Konfiguracja (wg `docs/build.md`, sekcja HIP dla Windows), w `cmd`. Uwaga: `%HIP_PATH%` konczy sie na `\`, wiec w cudzyslowie dac sciezke z ukosnikami (`\"` zjada cudzyslow):
 
 ```bat
-set PATH=%HIP_PATH%\bin;%PATH%
+call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
+set PATH=%HIP_PATH%bin;%PATH%
 cmake -S . -B build -G Ninja -DGPU_TARGETS=gfx1100 -DGGML_HIP=ON ^
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release ^
-  -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF
+  -DCMAKE_PREFIX_PATH="C:/Program Files/AMD/ROCm/7.2" -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF
 cmake --build build --target llama-server llama-cli llama-bench
 ```
 
-Kryterium zakonczenia fazy: konfiguracja konczy sie bez bledu, a w logu jest "Found OpenMP".
+Kryterium zakonczenia fazy: konfiguracja konczy sie bez bledu, w logu jest "Found OpenMP", a w `CMakeCache.txt` `GGML_OPENMP_ENABLED=ON`.
 
 ## Faza 1: kompilacja
 
@@ -41,10 +42,13 @@ Zasada: najmniejsza zmiana, guard `#if defined(__linux__)` albo galaz `_WIN32` w
 | 4 | `moe-cache.cu` `moe_cache_pcie_bytes_per_us()` (ok. 6466-6516) | `realpath`, `PATH_MAX`, sysfs | `#if defined(__linux__)`, inaczej `return 0.0`. Kod sam loguje "link not readable ... assumed" i bierze domyslna przepustowosc |
 | 5 | `moe-cache.cu` `moe_cache_sysfs_free()` (ok. 2222-2253) | kompiluje sie, ale `fopen` na sysfs zawiedzie | dziala przez fallback do `hipMemGetInfo`; opcjonalnie guard `__linux__`, zeby nie logowac "unavailable" |
 | 6 | `ggml/src/ggml-backend-moe-cache.h:205` | `GGML_API struct ggml_moe_cache_api ggml_moe_cache;` to **zmienna**, zdefiniowana w ggml-base (`ggml-backend.cpp:18`), uzywana z ggml-cpu i ggml-hip. Kazdy backend ma `GGML_BUILD` (`ggml/src/CMakeLists.txt:641`), wiec dostaje `dllexport` zamiast `dllimport`: nierozwiazany symbol przy `BUILD_SHARED_LIBS=ON` | krok 1: budowac statycznie (`-DBUILD_SHARED_LIBS=OFF`). Docelowo (opcjonalnie): funkcja-akcesor zamiast zmiennej |
-| 7 | `ggml-cpu.c` `ggml_cpu_moe_experts_multi()` (ok. 4573) | `#if defined(__AVX2__) && defined(GGML_USE_OPENMP)`: bez OpenMP kod po cichu wypada | doinstalowac `libomp` (Faza 0), sprawdzic "Found OpenMP" |
+| 7 | `ggml-cpu.c` `ggml_cpu_moe_experts_multi()` (ok. 4573) | `#if defined(__AVX2__) && defined(GGML_USE_OPENMP)`: bez OpenMP kod po cichu wypada | `libomp` z toolsetu MSVC (Faza 0), sprawdzic "Found OpenMP" |
 | 8 | testy autora (`tests/hybgpubench/*.sh`, `tests/coopbench`) | skrypty i pliki `.hip` pod Linuksa | `-DLLAMA_BUILD_TESTS=OFF`, budowac tylko potrzebne cele |
+| 9 | `moe-cache.cu` (przed `#include <windows.h>`) | `windows.h` definiuje makra `min` i `max`, ktore psuja `std::min` i `std::max` | `#define NOMINMAX` (wzorzec z `llama-mmap.cpp`) |
 
-Dalsze bledy kompilacji sa nieuniknione (kernele HIP, `__attribute__((address_space))` w `mmvq.cu`, `ext_vector_type` w `qwen4-hc.cu`): clang z HIP SDK je zna, ale pierwszy pelny build to pokaze.
+Status (build `llama-server`, `llama-cli`, `llama-bench` przechodzi, `llama-server --list-devices` widzi RX 7900 XTX): punkty 1-4 i 9 zrobione, punkt 5 bez zmian (brak sysfs konczy sie logiem "sysfs unavailable, using hip", bez bledu), 6-8 rozwiazane opcjami cmake. Kernele HIP z `__attribute__((address_space))` (`mmvq.cu`) i `ext_vector_type` (`qwen4-hc.cu`) kompiluja sie bez zmian.
+
+Pozostale ryzyko z Fazy 1: `ggml_hip_set_hw_queues()` to konstruktor statyczny. Sprawdzic w Fazie 2, czy `GPU_MAX_HW_QUEUES` i spol. dzialaja, skoro `amdhip64` laduje sie przy starcie procesu.
 
 Juz gotowe pod Windows, nie ruszac:
 
