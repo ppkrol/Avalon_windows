@@ -47,8 +47,9 @@ Zasada: najmniejsza zmiana, guard `#if defined(__linux__)` albo galaz `_WIN32` w
 | 9 | `moe-cache.cu` (przed `#include <windows.h>`) | `windows.h` definiuje makra `min` i `max`, ktore psuja `std::min` i `std::max` | `#define NOMINMAX` (wzorzec z `llama-mmap.cpp`) |
 | 10 | `ggml-cuda.cu` `ggml_backend_cuda_set_tensor_2d_async()` i `ggml_backend_cuda_buffer_set_tensor_2d()` | `hipMemcpy2DAsync` z pliku mapowanego (`MapViewOfFile`) kopiuje same zera i zwraca sukces (ze sterty dziala). Scheduler kopiuje tak eksperty do offloadu `MUL_MAT_ID` od 32 tokenow w batchu (`GGML_OP_OFFLOAD_MIN_BATCH`), wiec prefill dawal NaN | pomocnik `ggml_cuda_memcpy_2d_h2d_async`: pod `_WIN32` + HIP kopia wiersz po wierszu zwyklym `hipMemcpyAsync` (z mmap dziala), gdzie indziej bez zmian |
 | 11 | `moe-cache.cu` `moe_split_enabled()` | SPLIT (ekspert przeniesiony na GPU w trakcie warstwy, wsady od 2 tokenow, czyli weryfikacja MTP) zawiesza GPU: TDR po ok. 4 z 33 startow serwera (szczegoly w Fazie 2) | pod `_WIN32` SPLIT domyslnie wylaczony, `GGML_CUDA_MOE_SPLIT=1` wlacza go z powrotem |
+| 12 | `moe-cache.cu` `moe_cache_prepare_budget()` | `hipMemGetInfo` na Windows nie odejmuje VRAM innych procesow (ok. 2,5 GB), cache przepelnia VRAM, WDDM przenosi czesc do RAM (szczegoly w Fazie 4) | pod `_WIN32` wolny VRAM minus 3072 MiB przed wyliczeniem cache; `GGML_CUDA_MOE_CACHE_FREE_SOURCE=hip` wylacza korekte |
 
-Status (build `llama-server`, `llama-cli`, `llama-bench` przechodzi, `llama-server --list-devices` widzi RX 7900 XTX): punkty 1-4, 9-11 zrobione, punkt 5 bez zmian (brak sysfs konczy sie logiem "sysfs unavailable, using hip", bez bledu), 6-8 rozwiazane opcjami cmake. Kernele HIP z `__attribute__((address_space))` (`mmvq.cu`) i `ext_vector_type` (`qwen4-hc.cu`) kompiluja sie bez zmian.
+Status (build `llama-server`, `llama-cli`, `llama-bench` przechodzi, `llama-server --list-devices` widzi RX 7900 XTX): punkty 1-4, 9-12 zrobione, punkt 5 bez zmian (brak sysfs konczy sie logiem "sysfs unavailable, using hip", bez bledu), 6-8 rozwiazane opcjami cmake. Kernele HIP z `__attribute__((address_space))` (`mmvq.cu`) i `ext_vector_type` (`qwen4-hc.cu`) kompiluja sie bez zmian.
 
 Ryzyko z Fazy 1, `ggml_hip_set_hw_queues()` jako konstruktor statyczny: porownanie z zmiennymi ustawionymi przed startem procesu daje ten sam wynik (39,3 i 39,2 t/s), wiec nic nie trzeba zmieniac.
 
@@ -95,7 +96,7 @@ Status Fazy 2 (RX 7900 XTX 24 GB, 5800X3D, 64 GB RAM, model na NVMe, `GGML_CUDA_
 
 ## Faza 3: pamiec
 
-- **VRAM.** Budzet cache liczy sie z `hipMemGetInfo` (sysfs na Windows nie istnieje). Pulpit (DWM) zajmuje czesc VRAM, a autor wyliczyl rezerwe pod swoj system. Sprawdzic w logu linie `[moe-cache] ... capacity`; w razie bledow alokacji zwiekszyc `GGML_CUDA_MOE_CACHE_RESERVE_MB`. Plus: 24 GB zamiast 20 GB, wiecej miejsca na cache ekspertow.
+- **VRAM.** Budzet cache liczy sie z `hipMemGetInfo` (sysfs na Windows nie istnieje). Pulpit (DWM) zajmuje czesc VRAM, a autor wyliczyl rezerwe pod swoj system. Potwierdzone w Fazie 4: `hipMemGetInfo` nie odejmuje VRAM innych procesow, a WDDM zamiast bledu alokacji przenosi czesc VRAM do RAM (spadek ok. 2x). Poprawka: punkt 12 Fazy 1. Gdy inne programy zajmuja wiecej niz ok. 3 GB, dolozyc `GGML_CUDA_MOE_CACHE_RESERVE_MB`; pomaga licznik "Shared GPU memory" serwera w Menedzerze zadan (zdrowo: ponizej ok. 1 GB).
 - **RAM i mmap.** Model ma ok. 89 GiB przy 64 GB RAM. Autor twierdzi, ze 64 GB wystarcza (mmap, page cache), ale mierzyl to na Linuksie. Obserwowac twarde page faulty (Resource Monitor, `Hard Faults/sec`) i trzymac model na NVMe.
 - **Pinowanie.** Decyzja o domyslnym `PIN=0` na Windows po wynikach Fazy 2.
 
@@ -120,7 +121,8 @@ Status Fazy 4 (SPLIT wylaczony, `GGML_CUDA_MOE_PIN=0`, MTP, `-c 32768`, 512 toke
 - `GGML_CUDA_MOE_CACHE_RESERVE_MB=3072` (MTP, `-c 32768`, 512 tokenow): 69,3 - 70,4 t/s zamiast 45,1, praca GPU w oknie 111 us (model autora 155), GPU miedzy warstwami 240 zamiast 454 us, wolnych warstw 0, pamiec wspoldzielona 1327 MiB (prawdopodobnie zwykla pamiec hosta mapowana dla GPU), trafienia cache 90,7% zamiast 93,6%.
 - Przeglad rezerwy (MTP, przebiegi 2 / 3, t/s; w nawiasie maks. pamiec wspoldzielona serwera): 400 (domyslnie) 40,8 / 45,1 (4085 MiB), 1536 50,9 / 59,0 (2975), 2048 49,7 / 57,5 (2551), 3072 71,9 / 70,8 (1327), 4096 67,0 / 77,5 (913). Bez MTP przy 3072: 54,4 / 59,9 t/s (autor 62,4). Perplexity przez hosted MoE (`-ub 8`, 4 chunki po 2048) identyczna z rezerwa i bez: 2,8579 (inny tekst greedy z MTP nie jest bledem numerycznym).
 - Wykluczone przy tej okazji (mikrobenchmarki poza repo): kernele okna (`tests/hybgpubench` na Windows ok. 2x szybszy niz liczby autora z Linuksa, sprawdzenia bit w bit OK), kopie fill blokujace obliczenia (nie blokuja, przy kazdym `GPU_MAX_HW_QUEUES`). Uwaga na przyszlosc: HIP na Windows wysyla uruchomienia paczkami co 129 polecen, reszte dopiero przy `hipStreamQuery`, synchronizacji albo `hipEventRecord`; `hipGraphLaunch` kolejkuje graf wezel po wezle (ok. 0,2 - 0,65 us na wezel).
-- Otwarte: domyslna rezerwa VRAM na Windows (wartosc i sposob ustalenia) oraz ile wierszy CPU czeka na twarde page faulty z mmap.
+- Poprawka (punkt 12 Fazy 1, stala 3072 MiB na inne procesy, razem z rezerwa 400 MiB: 3472 MiB; inne procesy zajmuja tu stale 2 - 2,5 GB), bez zmiennych, 4 przebiegi: z MTP 37,0 / 76,4 / 87,1 / 83,6 t/s (autor 91,0), bez MTP 53,5 / 61,0 / 65,5 / 65,0 t/s (autor 62,4). Cache 15 422 MiB, praca GPU w oknie 90 us, GPU miedzy warstwami 227 us, maks. pamiec wspoldzielona serwera 913 MiB (bez MTP 574).
+- Otwarte: ile wierszy CPU czeka na twarde page faulty z mmap.
 
 Opcjonalnie: odczyt przepustowosci PCIe przez SetupAPI (`DEVPKEY_PciDevice_MaxLinkSpeed`, `DEVPKEY_PciDevice_MaxLinkWidth`) zamiast domyslnej wartosci w punkcie 4 Fazy 1. Dispatcher hosted MoE uzywa tej liczby do decyzji, wiec zla wartosc kosztuje wydajnosc.
 
